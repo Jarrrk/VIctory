@@ -30,7 +30,10 @@ RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// 2^27 ran the world's ~1,000 indirect mesh records empty (the G-buffer
+// stayed black); 2^31 fits them with headroom without letting a list of
+// garbage records run for seconds.
+static const uint BUDGET = 1u << 31;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
