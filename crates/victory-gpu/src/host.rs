@@ -170,11 +170,17 @@ fn create() -> windows::core::Result<Host> {
         // faulting address), read when the device is removed.
         if dred_on() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            match D3D12GetDebugInterface(&mut dred) {
+                Ok(()) => {
+                    if let Some(dred) = dred {
+                        dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        tracing::info!("device-removed data on");
+                    } else {
+                        tracing::warn!("no device-removed data settings interface");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "no device-removed data settings"),
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -306,12 +312,35 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// A reset of a still-open list and a second close both fail at the
+    /// allocator on the host; the runtime closes first instead (the title
+    /// may reset without a close, or call either from two threads).
+    #[test]
+    fn an_open_list_resets_and_a_closed_list_closes_again() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        // Recording state from creation: reset closes first.
+        list.reset();
+        // A second close is a no-op, not an error.
+        list.close();
+        list.close();
+        list.reset();
+        list.close();
+    }
 }
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Whether the list is recording (open), under the lock that makes
+    /// `close` and `reset` take turns. The title may call either from two
+    /// threads; without the lock their allocator calls contend and remove
+    /// the device.
+    lifecycle: Mutex<bool>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -563,6 +592,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                lifecycle: Mutex::new(true),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1073,6 +1103,10 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let mut open = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if !*open {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1088,6 +1122,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        *open = false;
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -1105,7 +1140,21 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
-        // SAFETY: the list is not executing.
+        // The title may reset without a close, and may call close and reset
+        // from two threads: the lock makes them take turns, and a list left
+        // open is closed first so the allocator is never reset while its
+        // list is recording (E_INVALIDARG, "did not reset").
+        let mut open = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if *open {
+            // SAFETY: our list, discarded without a submission.
+            if let Err(e) = unsafe { self.list.Close() } {
+                fail(format_args!(
+                    "a host command list did not close ({e}): a command recorded into it was invalid"
+                ));
+            }
+            *open = false;
+        }
+        // SAFETY: the list is closed and not executing.
         let reset = unsafe {
             self.allocator
                 .Reset()
@@ -1114,6 +1163,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        *open = true;
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1214,20 +1264,26 @@ impl HostList {
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        let mut ended: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)> = Vec::new();
+        for (first, last, copy) in states.values() {
+            let real = copy.state.load(Ordering::Relaxed);
+            if real != *first {
+                barriers.push(transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                ));
+            }
+            ended.push((copy.clone(), *last));
+        }
+        drop(states);
         if barriers.is_empty() && copies.is_empty() {
+            // Nothing to record, but the states still move on to where the
+            // list ends, for the lists after it.
+            for (copy, last) in ended {
+                copy.state.store(last, Ordering::Relaxed);
+            }
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1264,6 +1320,11 @@ impl HostList {
         };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        // The textures' real states become those the list ends with, for
+        // the lists after it: after the copies above read their starts.
+        for (copy, last) in ended {
+            copy.state.store(last, Ordering::Relaxed);
         }
         list.cast().ok()
     }

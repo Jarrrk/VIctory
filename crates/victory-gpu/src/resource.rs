@@ -1073,11 +1073,19 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// (no view takes them).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    // R9G9B9E5_SHAREDEXP shares no bit layout with any other format: the
+    // host takes views of it in no other format, and no other texture's
+    // host copy takes a view of it (the debug layer removes the device
+    // for such a view, "not a fully qualified format within the same
+    // family").
+    if format == 67 {
+        return Vec::new();
+    }
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
-        .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| f != format && f != 67 && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -1888,12 +1896,15 @@ mod tests {
     #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);
-        for f in [67, 28, 29, 41, 24, 26, 87, 35] {
+        for f in [28, 29, 41, 24, 26, 87, 35] {
             assert!(c.contains(&f), "{f}");
         }
-        for f in [42, 39, 40, 45, 27, 10, 56] {
+        for f in [42, 39, 40, 45, 27, 10, 56, 67] {
             assert!(!c.contains(&f), "{f}");
         }
+        // R9G9B9E5_SHAREDEXP views in no other format: the host removes
+        // the device for one.
+        assert!(castable(67).is_empty());
         let bc1 = castable(71);
         assert!(bc1.contains(&72) && bc1.contains(&80) && bc1.contains(&81));
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
